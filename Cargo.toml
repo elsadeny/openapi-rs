@@ -1,16 +1,21 @@
 [package]
-name = "openapi-rs"
+name = "openapi-rs-sdk"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Protobuf/gRPC trading SDK with symbol-aware lot validation, login, balance, and order flows"
 license = "MIT"
 readme = "README.md"
-homepage = "https://github.com/REPLACE_WITH_YOUR_GITHUB_USERNAME/openapi-rs"
-repository = "https://github.com/REPLACE_WITH_YOUR_GITHUB_USERNAME/openapi-rs"
-documentation = "https://docs.rs/openapi-rs"
+homepage = "https://github.com/elsadeny/openapi-rs"
+repository = "https://github.com/elsadeny/openapi-rs"
+documentation = "https://docs.rs/openapi-rs-sdk"
 keywords = ["grpc", "protobuf", "trading", "sdk", "rust"]
 categories = ["api-bindings", "network-programming"]
+exclude = [".DS_Store"]
+
+[lib]
+name = "openapi_rs"
+path = "src/lib.rs"
 
 [dependencies]
 prost = "0.13.5"

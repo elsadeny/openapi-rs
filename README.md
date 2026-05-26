@@ -1,4 +1,4 @@
-# openapi-rs SDK
+# openapi-rs-sdk
 
 Real gRPC + protobuf trading SDK in Rust with symbol-aware lot validation.
 
@@ -143,30 +143,27 @@ cargo doc --no-deps --open
 
 ## Publish To crates.io
 
-1. Update package metadata placeholders in `Cargo.toml`:
-  - `homepage`
-  - `repository`
-2. Ensure your crate name is available:
+1. Ensure your crate name is available:
 
 ```bash
-cargo search openapi-rs --limit 5
+cargo search openapi-rs-sdk --limit 5
 ```
 
-3. Package validation:
+2. Package validation:
 
 ```bash
 cargo package
 cargo publish --dry-run
 ```
 
-4. Login and publish:
+3. Login and publish:
 
 ```bash
 cargo login <CRATES_IO_TOKEN>
 cargo publish
 ```
 
-5. Release updates:
+4. Release updates:
   - bump version in `Cargo.toml`
   - tag in git (recommended)
   - run `cargo publish` again
@@ -178,28 +175,34 @@ cargo publish
 After publishing, in another Rust project:
 
 ```bash
-cargo add openapi-rs
+cargo add openapi-rs-sdk
 ```
 
 or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-openapi-rs = "0.1"
+openapi-rs-sdk = "0.1"
 ```
 
 ### Directly from GitHub (before first publish)
 
 ```toml
 [dependencies]
-openapi-rs = { git = "https://github.com/<your-user>/openapi-rs", tag = "v0.1.0" }
+openapi-rs-sdk = { git = "https://github.com/elsadeny/openapi-rs", tag = "v0.1.0" }
 ```
 
 You can also pin a commit:
 
 ```toml
 [dependencies]
-openapi-rs = { git = "https://github.com/<your-user>/openapi-rs", rev = "<commit-sha>" }
+openapi-rs-sdk = { git = "https://github.com/elsadeny/openapi-rs", rev = "<commit-sha>" }
+
+Import in Rust code:
+
+```rust
+use openapi_rs::{OpenApiSdkClient, OrderSide};
+```
 ```
 
 ## Production Notes
