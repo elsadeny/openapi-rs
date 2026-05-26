@@ -1,6 +1,6 @@
 [package]
 name = "openapi-rs-sdk"
-version = "0.2.1"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.85"
 description = "Protobuf/gRPC trading SDK with symbol-aware lot validation, login, balance, order flows, and candle APIs"

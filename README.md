@@ -1,3 +1,19 @@
+# Version 0.2.3
+
+**New:** User-pluggable strategy interface for replay/backtest via the `ReplayStrategy` trait. Implement your own strategy struct and pass it to the replay engine for rapid testing.
+
+```rust
+pub struct MyStrategy { /* fields */ }
+
+impl ReplayStrategy for MyStrategy {
+  fn on_candle(&mut self, candle: &Candle) -> Option<BreakoutSignal> {
+    // Your logic here
+    None
+  }
+}
+```
+
+See the main crate README for usage details.
 # openapi-rs-sdk
 
 Real gRPC + protobuf trading SDK in Rust with a broker-forwarding adapter server.
