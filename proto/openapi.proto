@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package openapi;
+
+service OpenApiService {
+  rpc RegisterUser(RegisterUserRequest) returns (RegisterUserResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+  rpc FetchBalance(FetchBalanceRequest) returns (FetchBalanceResponse);
+  rpc PlaceMarketOrder(PlaceMarketOrderRequest) returns (PlaceMarketOrderResponse);
+  rpc QuoteVolume(QuoteVolumeRequest) returns (QuoteVolumeResponse);
+}
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  ORDER_SIDE_BUY = 1;
+  ORDER_SIDE_SELL = 2;
+}
+
+message RegisterUserRequest {
+  string username = 1;
+  string password = 2;
+  string account_id = 3;
+  string initial_balance = 4;
+}
+
+message RegisterUserResponse {
+  bool success = 1;
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginResponse {
+  string session_token = 1;
+}
+
+message LogoutRequest {
+  string session_token = 1;
+}
+
+message LogoutResponse {
+  bool success = 1;
+}
+
+message FetchBalanceRequest {
+  string session_token = 1;
+}
+
+message AccountBalance {
+  string account_id = 1;
+  string balance = 2;
+  string used_margin = 3;
+  string free_margin = 4;
+}
+
+message FetchBalanceResponse {
+  AccountBalance balance = 1;
+}
+
+message PlaceMarketOrderRequest {
+  string session_token = 1;
+  string symbol = 2;
+  string lot_size = 3;
+  OrderSide side = 4;
+}
+
+message OrderExecution {
+  uint64 order_id = 1;
+  string account_id = 2;
+  string symbol = 3;
+  string lot_size = 4;
+  string volume = 5;
+  OrderSide side = 6;
+  string margin_used = 7;
+}
+
+message PlaceMarketOrderResponse {
+  OrderExecution execution = 1;
+}
+
+message QuoteVolumeRequest {
+  string symbol = 1;
+  string lot_size = 2;
+}
+
+message VolumeQuote {
+  string symbol = 1;
+  string lot_size = 2;
+  string volume = 3;
+}
+
+message QuoteVolumeResponse {
+  VolumeQuote quote = 1;
+}
