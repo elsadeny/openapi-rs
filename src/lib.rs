@@ -17,8 +17,14 @@ use futures_core::Stream;
 use rust_decimal::Decimal;
 use thiserror::Error;
 use tokio::sync::Mutex as TokioMutex;
+#[cfg(feature = "live")]
 use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
+
+#[cfg(feature = "demo")]
+mod spotware;
+#[cfg(feature = "demo")]
+pub use spotware::{SpotwareAdapterConfig, SpotwareGrpcAdapterServer};
 
 pub mod pb {
     tonic::include_proto!("openapi");
@@ -704,6 +710,7 @@ impl OpenApiGrpcServer {
     }
 }
 
+#[cfg(feature = "live")]
 #[derive(Clone, Debug)]
 pub struct BrokerGrpcAdapterServer {
     upstream: Arc<
@@ -711,6 +718,7 @@ pub struct BrokerGrpcAdapterServer {
     >,
 }
 
+#[cfg(feature = "live")]
 impl BrokerGrpcAdapterServer {
     pub async fn connect(upstream_url: impl Into<String>) -> Result<Self, tonic::transport::Error> {
         let client = pb::open_api_service_client::OpenApiServiceClient::connect(upstream_url.into())
@@ -848,6 +856,7 @@ impl pb::open_api_service_server::OpenApiService for OpenApiGrpcServer {
     }
 }
 
+#[cfg(feature = "live")]
 #[tonic::async_trait]
 impl pb::open_api_service_server::OpenApiService for BrokerGrpcAdapterServer {
     type StreamCandlesStream =

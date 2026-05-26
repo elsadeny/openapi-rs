@@ -1,6 +1,6 @@
 [package]
 name = "openapi-rs-sdk"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Protobuf/gRPC trading SDK with symbol-aware lot validation, login, balance, order flows, and candle APIs"
@@ -17,8 +17,16 @@ exclude = [".DS_Store"]
 name = "openapi_rs"
 path = "src/lib.rs"
 
+[features]
+default = ["full"]
+backtest = []
+live = []
+demo = ["live", "dep:ctrader-rs"]
+full = ["backtest", "live", "demo"]
+
 [dependencies]
 chrono = { version = "0.4.40", default-features = true }
+ctrader-rs = { version = "0.1.2", path = "../vendor/ctrader-rs", optional = true }
 futures-core = "0.3.31"
 prost = "0.13.5"
 rust_decimal = "1.39.0"
@@ -26,6 +34,14 @@ thiserror = "2.0.12"
 tokio = { version = "1.41.1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-stream = { version = "0.1.16", features = ["net"] }
 tonic = { version = "0.12.3", features = ["transport"] }
+
+[[example]]
+name = "grpc_server"
+required-features = ["live"]
+
+[[example]]
+name = "grpc_client"
+required-features = ["backtest"]
 
 [build-dependencies]
 prost-build = "0.13.5"

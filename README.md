@@ -12,6 +12,29 @@ Real gRPC + protobuf trading SDK in Rust with a broker-forwarding adapter server
 - Protobuf contract and generated tonic server/client types
 - Async SDK client wrapper (`OpenApiSdkClient`)
 
+### Cargo Feature Modes
+
+- `backtest`: local in-memory engine + gRPC service for simulation/replay flows
+- `live`: broker-forwarding gRPC adapter (`BrokerGrpcAdapterServer`)
+- `demo`: Spotware demo adapter (`SpotwareGrpcAdapterServer`); implies `live`
+- `full`: enables all modes above (default)
+
+Build examples:
+
+```bash
+# backtest only
+cargo check --no-default-features --features backtest
+
+# live broker-proxy only
+cargo check --no-default-features --features live
+
+# spotware demo adapter (includes live)
+cargo check --no-default-features --features demo
+
+# all modes (default)
+cargo check --features full
+```
+
 ## Project Layout
 
 - `proto/openapi.proto`: protobuf contract
