@@ -1,13 +1,13 @@
 # openapi-rs-sdk
 
-Real gRPC + protobuf trading SDK in Rust with symbol-aware lot validation.
+Real gRPC + protobuf trading SDK in Rust with a broker-forwarding adapter server.
 
 ## Features
 
 - Symbol metadata registry (`contract_size`, min/max lot, step)
 - Lot-size-only volume quoting (`symbol + lot_size -> volume`)
 - Auth flow (`register_user`, `login`, `logout`)
-- Account flow (`fetch_balance`)
+- Account flow (`fetch_balance`, `fetch_open_positions`)
 - Trading flow (`place_market_order`)
 - Protobuf contract and generated tonic server/client types
 - Async SDK client wrapper (`OpenApiSdkClient`)
@@ -33,19 +33,19 @@ Real gRPC + protobuf trading SDK in Rust with symbol-aware lot validation.
 cargo test
 ```
 
-2. Start local server:
+2. Start broker adapter server:
 
 ```bash
-cargo run --example grpc_server
+BROKER_OPENAPI_GRPC_URL=http://<broker-host>:<broker-port> cargo run --example grpc_server
 ```
 
 3. In another terminal, run SDK client:
 
 ```bash
-cargo run --example grpc_client
+OPENAPI_GRPC_URL=http://127.0.0.1:50051 cargo run --example grpc_client
 ```
 
-You should see quote, order execution, and balance output.
+You should see quote, order execution, open positions, and balance output.
 
 ## SDK Client Usage
 
@@ -55,7 +55,8 @@ use rust_decimal::Decimal;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = OpenApiSdkClient::connect("http://127.0.0.1:50051").await?;
+  let grpc_url = std::env::var("OPENAPI_GRPC_URL")?;
+    let mut client = OpenApiSdkClient::connect(grpc_url).await?;
 
     let token = client.login("alice", "secret").await?;
 
@@ -63,9 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("quoted volume: {}", quote.volume);
 
     let execution = client
-        .place_market_order(token.clone(), "EURUSD", Decimal::new(15, 2), OrderSide::Buy)
+      .place_market_order(token.clone(), "EURUSD", Decimal::new(1, 2), OrderSide::Sell)
         .await?;
     println!("order id: {}", execution.order_id);
+
+    let positions = client.fetch_open_positions(token.clone()).await?;
+    println!("open positions: {}", positions.len());
 
     let balance = client.fetch_balance(token.clone()).await?;
     println!("free margin: {}", balance.free_margin);
@@ -89,11 +93,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `OpenApiService::login`
 - `OpenApiService::logout`
 - `OpenApiService::fetch_balance`
+- `OpenApiService::fetch_open_positions`
 - `OpenApiService::place_market_order`
 
 ### gRPC Transport
 
 - Server adapter: `OpenApiGrpcServer`
+- Broker proxy adapter: `BrokerGrpcAdapterServer`
 - Generated tonic service trait: `pb::open_api_service_server::OpenApiService`
 - SDK client wrapper: `OpenApiSdkClient`
 
@@ -207,6 +213,27 @@ use openapi_rs::{OpenApiSdkClient, OrderSide};
 
 ## Production Notes
 
-- Current storage is in-memory for users/sessions/accounts
-- Session tokens are simple IDs (`sess-N`) for local/dev usage
-- Add persistent storage and stronger auth/token strategy for production
+- `examples/grpc_server.rs` is a broker-forwarding adapter and does not run local simulator state
+- Set `BROKER_OPENAPI_GRPC_URL` to your broker OpenAPI gRPC endpoint
+- Set your bot/client `OPENAPI_GRPC_URL` to the adapter endpoint
+
+## Tiny Broker Smoke Test
+
+Run the live smoke test (ignored by default) against your broker-connected adapter:
+
+```bash
+OPENAPI_GRPC_URL=http://127.0.0.1:50051 \
+OPENAPI_USERNAME=<broker-user> \
+OPENAPI_PASSWORD=<broker-pass> \
+OPENAPI_SMOKE_SYMBOL=EURUSD \
+cargo test --test broker_smoke -- --ignored --nocapture
+```
+
+The smoke flow performs:
+
+- login
+- place market order (`0.01` sell)
+- fetch balance
+- fetch open positions
+
+For broker platform confirmation, match the returned `order_id`/position on your broker UI or terminal.

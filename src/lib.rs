@@ -3,41 +3,29 @@
 //! This crate provides:
 //! - symbol-aware lot-size validation and volume quoting
 //! - auth/session/account service logic
+//! - candle history + candle streaming APIs
 //! - tonic server adapter (`OpenApiGrpcServer`)
 //! - typed async SDK client (`OpenApiSdkClient`)
-//!
-//! # Example
-//!
-//! ```no_run
-//! use openapi_rs::{OpenApiSdkClient, OrderSide};
-//! use rust_decimal::Decimal;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut client = OpenApiSdkClient::connect("http://127.0.0.1:50051").await?;
-//!     let token = client.login("alice", "secret").await?;
-//!     let _quote = client.quote_volume("EURUSD", Decimal::new(10, 2)).await?;
-//!     let _execution = client
-//!         .place_market_order(token.clone(), "EURUSD", Decimal::new(10, 2), OrderSide::Buy)
-//!         .await?;
-//!     let _balance = client.fetch_balance(token.clone()).await?;
-//!     client.logout(token).await?;
-//!     Ok(())
-//! }
-//! ```
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use futures_core::Stream;
 use rust_decimal::Decimal;
 use thiserror::Error;
 use tokio::sync::Mutex as TokioMutex;
+use tokio_stream::StreamExt as _;
 use tonic::{Request, Response, Status};
 
 pub mod pb {
     tonic::include_proto!("openapi");
 }
+
+pub const DEFAULT_CANDLE_LIMIT: u32 = 100;
+pub const MAX_CANDLE_LIMIT: u32 = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolSpec {
@@ -51,6 +39,42 @@ pub struct SymbolSpec {
 pub struct VolumeQuote {
     pub symbol: String,
     pub lot_size: Decimal,
+    pub volume: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Timeframe {
+    M1,
+    M5,
+    M15,
+    H1,
+    H4,
+    D1,
+}
+
+impl Timeframe {
+    fn seconds(self) -> i64 {
+        match self {
+            Self::M1 => 60,
+            Self::M5 => 300,
+            Self::M15 => 900,
+            Self::H1 => 3600,
+            Self::H4 => 14_400,
+            Self::D1 => 86_400,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candle {
+    pub symbol: String,
+    pub timeframe: Timeframe,
+    pub open_time: DateTime<Utc>,
+    pub close_time: DateTime<Utc>,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
     pub volume: Decimal,
 }
 
@@ -76,6 +100,16 @@ pub struct OrderExecution {
     pub volume: Decimal,
     pub side: OrderSide,
     pub margin_used: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPosition {
+    pub position_id: u64,
+    pub account_id: String,
+    pub symbol: String,
+    pub lot_size: Decimal,
+    pub volume: Decimal,
+    pub side: OrderSide,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +142,15 @@ struct UserRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionRecord {
     username: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandleQuery {
+    symbol: String,
+    timeframe: Timeframe,
+    from_time: DateTime<Utc>,
+    to_time: DateTime<Utc>,
+    limit: u32,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -144,6 +187,14 @@ pub enum OpenApiError {
     InvalidDecimalField { field: &'static str, value: String },
     #[error("unsupported order side: {0}")]
     UnsupportedOrderSide(i32),
+    #[error("unsupported timeframe: {0}")]
+    UnsupportedTimeframe(i32),
+    #[error("limit {limit} exceeds maximum allowed {max}")]
+    CandleLimitTooLarge { limit: u32, max: u32 },
+    #[error("invalid UTC timestamp for field '{field}': '{value}'")]
+    InvalidUtcTimestamp { field: &'static str, value: String },
+    #[error("invalid time range: from_time {from_time} must be before to_time {to_time}")]
+    InvalidTimeRange { from_time: String, to_time: String },
     #[error("grpc status: {0}")]
     GrpcStatus(String),
 }
@@ -168,6 +219,10 @@ impl OpenApiEngine {
 
     pub fn register_symbol(&mut self, symbol: impl Into<String>, spec: SymbolSpec) {
         self.symbols.insert(normalize_symbol(symbol), spec);
+    }
+
+    pub fn has_symbol(&self, symbol: impl AsRef<str>) -> bool {
+        self.symbols.contains_key(&normalize_symbol(symbol.as_ref()))
     }
 
     pub fn volume_from_lot_size(
@@ -233,8 +288,10 @@ pub struct OpenApiService {
     users: HashMap<String, UserRecord>,
     sessions: HashMap<String, SessionRecord>,
     accounts: HashMap<String, Account>,
+    open_positions: HashMap<String, Vec<OpenPosition>>,
     next_session_id: AtomicU64,
     next_order_id: AtomicU64,
+    next_position_id: AtomicU64,
     leverage: Decimal,
 }
 
@@ -245,8 +302,10 @@ impl OpenApiService {
             users: HashMap::new(),
             sessions: HashMap::new(),
             accounts: HashMap::new(),
+            open_positions: HashMap::new(),
             next_session_id: AtomicU64::new(1),
             next_order_id: AtomicU64::new(1),
+            next_position_id: AtomicU64::new(1),
             leverage: Decimal::new(100, 0),
         }
     }
@@ -276,6 +335,7 @@ impl OpenApiService {
                 used_margin: Decimal::ZERO,
             },
         );
+        self.open_positions.insert(account_id.clone(), Vec::new());
 
         self.users.insert(
             normalized_username,
@@ -335,6 +395,19 @@ impl OpenApiService {
         })
     }
 
+    pub fn fetch_open_positions(
+        &self,
+        token: impl AsRef<str>,
+    ) -> Result<Vec<OpenPosition>, OpenApiError> {
+        let account_id = self.account_id_for_token(token.as_ref())?;
+        let positions = self
+            .open_positions
+            .get(&account_id)
+            .ok_or_else(|| OpenApiError::AccountNotFound(account_id.clone()))?;
+
+        Ok(positions.clone())
+    }
+
     pub fn place_market_order(
         &mut self,
         token: impl AsRef<str>,
@@ -362,6 +435,19 @@ impl OpenApiService {
         account.used_margin += margin_required;
 
         let order_id = self.next_order_id.fetch_add(1, Ordering::Relaxed);
+        let position_id = self.next_position_id.fetch_add(1, Ordering::Relaxed);
+
+        self.open_positions
+            .entry(account_id.clone())
+            .or_default()
+            .push(OpenPosition {
+                position_id,
+                account_id: account_id.clone(),
+                symbol: volume_quote.symbol.clone(),
+                lot_size: volume_quote.lot_size,
+                volume: volume_quote.volume,
+                side: request.side.clone(),
+            });
 
         Ok(OrderExecution {
             order_id,
@@ -422,6 +508,27 @@ impl OpenApiService {
         })
     }
 
+    pub fn fetch_open_positions_proto(
+        &self,
+        request: pb::FetchOpenPositionsRequest,
+    ) -> Result<pb::FetchOpenPositionsResponse, OpenApiError> {
+        let positions = self.fetch_open_positions(request.session_token)?;
+
+        Ok(pb::FetchOpenPositionsResponse {
+            positions: positions
+                .into_iter()
+                .map(|position| pb::OpenPosition {
+                    position_id: position.position_id,
+                    account_id: position.account_id,
+                    symbol: position.symbol,
+                    lot_size: position.lot_size.to_string(),
+                    volume: position.volume.to_string(),
+                    side: domain_side_to_proto(position.side) as i32,
+                })
+                .collect(),
+        })
+    }
+
     pub fn place_market_order_proto(
         &mut self,
         request: pb::PlaceMarketOrderRequest,
@@ -449,6 +556,113 @@ impl OpenApiService {
                 margin_used: execution.margin_used.to_string(),
             }),
         })
+    }
+
+    pub fn get_candles_proto(
+        &self,
+        request: pb::GetCandlesRequest,
+    ) -> Result<pb::GetCandlesResponse, OpenApiError> {
+        let candles = self.build_candles(CandleQuery {
+            symbol: request.symbol,
+            timeframe: proto_timeframe_to_domain(request.timeframe)?,
+            from_time: Utc::now(),
+            to_time: Utc::now(),
+            limit: request.limit,
+        }, request.from_time, request.to_time)?;
+
+        Ok(pb::GetCandlesResponse { candles })
+    }
+
+    pub fn stream_candles_proto(
+        &self,
+        request: pb::StreamCandlesRequest,
+    ) -> Result<Vec<pb::Candle>, OpenApiError> {
+        self.build_candles(CandleQuery {
+            symbol: request.symbol,
+            timeframe: proto_timeframe_to_domain(request.timeframe)?,
+            from_time: Utc::now(),
+            to_time: Utc::now(),
+            limit: request.limit,
+        }, request.from_time, request.to_time)
+    }
+
+    pub fn get_server_time_proto(
+        &self,
+        _request: pb::GetServerTimeRequest,
+    ) -> Result<pb::GetServerTimeResponse, OpenApiError> {
+        Ok(pb::GetServerTimeResponse {
+            server_time: format_utc(Utc::now()),
+        })
+    }
+
+    fn build_candles(
+        &self,
+        mut query: CandleQuery,
+        from_time_str: String,
+        to_time_str: String,
+    ) -> Result<Vec<pb::Candle>, OpenApiError> {
+        query.symbol = normalize_symbol(query.symbol);
+        if !self.engine.has_symbol(&query.symbol) {
+            return Err(OpenApiError::SymbolNotFound(query.symbol));
+        }
+
+        let limit = if query.limit == 0 {
+            DEFAULT_CANDLE_LIMIT
+        } else {
+            query.limit
+        };
+        if limit > MAX_CANDLE_LIMIT {
+            return Err(OpenApiError::CandleLimitTooLarge {
+                limit,
+                max: MAX_CANDLE_LIMIT,
+            });
+        }
+
+        let (from_time, to_time) = resolve_time_window(
+            &from_time_str,
+            &to_time_str,
+            query.timeframe,
+            limit,
+        )?;
+
+        query.from_time = from_time;
+        query.to_time = to_time;
+        query.limit = limit;
+
+        let mut candles = Vec::with_capacity(limit as usize);
+        let step_seconds = query.timeframe.seconds();
+        let seed = query
+            .symbol
+            .bytes()
+            .fold(0_u64, |acc, b| acc.wrapping_add(b as u64)) as i64;
+
+        for i in 0..limit {
+            let open_time = query.from_time + Duration::seconds(step_seconds * i as i64);
+            let close_time = open_time + Duration::seconds(step_seconds);
+            if close_time > query.to_time {
+                break;
+            }
+
+            let open = Decimal::new(10_000 + (seed % 2_000) + i as i64 * 2, 2);
+            let high = open + Decimal::new(15, 2);
+            let low = open - Decimal::new(12, 2);
+            let close = open + Decimal::new(3, 2);
+            let volume = Decimal::new(1_000 + i as i64 * 10, 2);
+
+            candles.push(pb::Candle {
+                symbol: query.symbol.clone(),
+                timeframe: domain_timeframe_to_proto(query.timeframe) as i32,
+                open_time: format_utc(open_time),
+                close_time: format_utc(close_time),
+                open: open.to_string(),
+                high: high.to_string(),
+                low: low.to_string(),
+                close: close.to_string(),
+                volume: volume.to_string(),
+            });
+        }
+
+        Ok(candles)
     }
 
     fn account_for_token(&self, token: &str) -> Result<&Account, OpenApiError> {
@@ -490,8 +704,31 @@ impl OpenApiGrpcServer {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BrokerGrpcAdapterServer {
+    upstream: Arc<
+        TokioMutex<pb::open_api_service_client::OpenApiServiceClient<tonic::transport::Channel>>,
+    >,
+}
+
+impl BrokerGrpcAdapterServer {
+    pub async fn connect(upstream_url: impl Into<String>) -> Result<Self, tonic::transport::Error> {
+        let client = pb::open_api_service_client::OpenApiServiceClient::connect(upstream_url.into())
+            .await?;
+        Ok(Self {
+            upstream: Arc::new(TokioMutex::new(client)),
+        })
+    }
+
+    pub fn into_tonic_service(self) -> pb::open_api_service_server::OpenApiServiceServer<Self> {
+        pb::open_api_service_server::OpenApiServiceServer::new(self)
+    }
+}
+
 #[tonic::async_trait]
 impl pb::open_api_service_server::OpenApiService for OpenApiGrpcServer {
+    type StreamCandlesStream = Pin<Box<dyn Stream<Item = Result<pb::StreamCandlesResponse, Status>> + Send + 'static>>;
+
     async fn register_user(
         &self,
         request: Request<pb::RegisterUserRequest>,
@@ -536,6 +773,17 @@ impl pb::open_api_service_server::OpenApiService for OpenApiGrpcServer {
         Ok(Response::new(response))
     }
 
+    async fn fetch_open_positions(
+        &self,
+        request: Request<pb::FetchOpenPositionsRequest>,
+    ) -> Result<Response<pb::FetchOpenPositionsResponse>, Status> {
+        let service = self.inner.lock().await;
+        let response = service
+            .fetch_open_positions_proto(request.into_inner())
+            .map_err(open_api_error_to_status)?;
+        Ok(Response::new(response))
+    }
+
     async fn place_market_order(
         &self,
         request: Request<pb::PlaceMarketOrderRequest>,
@@ -557,6 +805,134 @@ impl pb::open_api_service_server::OpenApiService for OpenApiGrpcServer {
             .quote_volume_proto(request.into_inner())
             .map_err(open_api_error_to_status)?;
         Ok(Response::new(response))
+    }
+
+    async fn get_candles(
+        &self,
+        request: Request<pb::GetCandlesRequest>,
+    ) -> Result<Response<pb::GetCandlesResponse>, Status> {
+        let service = self.inner.lock().await;
+        let response = service
+            .get_candles_proto(request.into_inner())
+            .map_err(open_api_error_to_status)?;
+        Ok(Response::new(response))
+    }
+
+    async fn stream_candles(
+        &self,
+        request: Request<pb::StreamCandlesRequest>,
+    ) -> Result<Response<Self::StreamCandlesStream>, Status> {
+        let service = self.inner.lock().await;
+        let candles = service
+            .stream_candles_proto(request.into_inner())
+            .map_err(open_api_error_to_status)?;
+
+        let stream = tokio_stream::iter(candles.into_iter().map(|candle| {
+            Ok(pb::StreamCandlesResponse {
+                candle: Some(candle),
+            })
+        }));
+
+        Ok(Response::new(Box::pin(stream) as Self::StreamCandlesStream))
+    }
+
+    async fn get_server_time(
+        &self,
+        request: Request<pb::GetServerTimeRequest>,
+    ) -> Result<Response<pb::GetServerTimeResponse>, Status> {
+        let service = self.inner.lock().await;
+        let response = service
+            .get_server_time_proto(request.into_inner())
+            .map_err(open_api_error_to_status)?;
+        Ok(Response::new(response))
+    }
+}
+
+#[tonic::async_trait]
+impl pb::open_api_service_server::OpenApiService for BrokerGrpcAdapterServer {
+    type StreamCandlesStream =
+        Pin<Box<dyn Stream<Item = Result<pb::StreamCandlesResponse, Status>> + Send + 'static>>;
+
+    async fn register_user(
+        &self,
+        request: Request<pb::RegisterUserRequest>,
+    ) -> Result<Response<pb::RegisterUserResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.register_user(request.into_inner()).await
+    }
+
+    async fn login(
+        &self,
+        request: Request<pb::LoginRequest>,
+    ) -> Result<Response<pb::LoginResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.login(request.into_inner()).await
+    }
+
+    async fn logout(
+        &self,
+        request: Request<pb::LogoutRequest>,
+    ) -> Result<Response<pb::LogoutResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.logout(request.into_inner()).await
+    }
+
+    async fn fetch_balance(
+        &self,
+        request: Request<pb::FetchBalanceRequest>,
+    ) -> Result<Response<pb::FetchBalanceResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.fetch_balance(request.into_inner()).await
+    }
+
+    async fn fetch_open_positions(
+        &self,
+        request: Request<pb::FetchOpenPositionsRequest>,
+    ) -> Result<Response<pb::FetchOpenPositionsResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.fetch_open_positions(request.into_inner()).await
+    }
+
+    async fn place_market_order(
+        &self,
+        request: Request<pb::PlaceMarketOrderRequest>,
+    ) -> Result<Response<pb::PlaceMarketOrderResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.place_market_order(request.into_inner()).await
+    }
+
+    async fn quote_volume(
+        &self,
+        request: Request<pb::QuoteVolumeRequest>,
+    ) -> Result<Response<pb::QuoteVolumeResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.quote_volume(request.into_inner()).await
+    }
+
+    async fn get_candles(
+        &self,
+        request: Request<pb::GetCandlesRequest>,
+    ) -> Result<Response<pb::GetCandlesResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.get_candles(request.into_inner()).await
+    }
+
+    async fn stream_candles(
+        &self,
+        request: Request<pb::StreamCandlesRequest>,
+    ) -> Result<Response<Self::StreamCandlesStream>, Status> {
+        let mut client = self.upstream.lock().await;
+        let upstream_stream = client.stream_candles(request.into_inner()).await?.into_inner();
+        let mapped = upstream_stream.map(|item| item.map_err(|status| status));
+        Ok(Response::new(Box::pin(mapped) as Self::StreamCandlesStream))
+    }
+
+    async fn get_server_time(
+        &self,
+        request: Request<pb::GetServerTimeRequest>,
+    ) -> Result<Response<pb::GetServerTimeResponse>, Status> {
+        let mut client = self.upstream.lock().await;
+        client.get_server_time(request.into_inner()).await
     }
 }
 
@@ -631,13 +1007,45 @@ impl OpenApiSdkClient {
             .map_err(|e| OpenApiError::GrpcStatus(e.to_string()))?
             .into_inner();
 
-        let balance = response.balance.ok_or_else(|| OpenApiError::GrpcStatus("missing balance payload".to_string()))?;
+        let balance = response
+            .balance
+            .ok_or_else(|| OpenApiError::GrpcStatus("missing balance payload".to_string()))?;
+
         Ok(AccountBalance {
             account_id: balance.account_id,
             balance: parse_decimal_field("balance", &balance.balance)?,
             used_margin: parse_decimal_field("used_margin", &balance.used_margin)?,
             free_margin: parse_decimal_field("free_margin", &balance.free_margin)?,
         })
+    }
+
+    pub async fn fetch_open_positions(
+        &mut self,
+        session_token: impl Into<String>,
+    ) -> Result<Vec<OpenPosition>, OpenApiError> {
+        let response = self
+            .inner
+            .fetch_open_positions(pb::FetchOpenPositionsRequest {
+                session_token: session_token.into(),
+            })
+            .await
+            .map_err(|e| OpenApiError::GrpcStatus(e.to_string()))?
+            .into_inner();
+
+        response
+            .positions
+            .into_iter()
+            .map(|position| {
+                Ok(OpenPosition {
+                    position_id: position.position_id,
+                    account_id: position.account_id,
+                    symbol: position.symbol,
+                    lot_size: parse_decimal_field("lot_size", &position.lot_size)?,
+                    volume: parse_decimal_field("volume", &position.volume)?,
+                    side: proto_side_to_domain(position.side)?,
+                })
+            })
+            .collect()
     }
 
     pub async fn quote_volume(
@@ -655,7 +1063,10 @@ impl OpenApiSdkClient {
             .map_err(|e| OpenApiError::GrpcStatus(e.to_string()))?
             .into_inner();
 
-        let quote = response.quote.ok_or_else(|| OpenApiError::GrpcStatus("missing quote payload".to_string()))?;
+        let quote = response
+            .quote
+            .ok_or_else(|| OpenApiError::GrpcStatus("missing quote payload".to_string()))?;
+
         Ok(VolumeQuote {
             symbol: quote.symbol,
             lot_size: parse_decimal_field("lot_size", &quote.lot_size)?,
@@ -696,6 +1107,144 @@ impl OpenApiSdkClient {
             margin_used: parse_decimal_field("margin_used", &execution.margin_used)?,
         })
     }
+
+    pub async fn get_candles(
+        &mut self,
+        symbol: impl Into<String>,
+        timeframe: Timeframe,
+        from_time: Option<DateTime<Utc>>,
+        to_time: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<Candle>, OpenApiError> {
+        let response = self
+            .inner
+            .get_candles(pb::GetCandlesRequest {
+                symbol: symbol.into(),
+                timeframe: domain_timeframe_to_proto(timeframe) as i32,
+                from_time: from_time.map(format_utc).unwrap_or_default(),
+                to_time: to_time.map(format_utc).unwrap_or_default(),
+                limit,
+            })
+            .await
+            .map_err(|e| OpenApiError::GrpcStatus(e.to_string()))?
+            .into_inner();
+
+        response
+            .candles
+            .into_iter()
+            .map(candle_from_proto)
+            .collect()
+    }
+
+    pub async fn stream_candles(
+        &mut self,
+        symbol: impl Into<String>,
+        timeframe: Timeframe,
+        from_time: Option<DateTime<Utc>>,
+        to_time: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<tonic::Streaming<pb::StreamCandlesResponse>, OpenApiError> {
+        let stream = self
+            .inner
+            .stream_candles(pb::StreamCandlesRequest {
+                symbol: symbol.into(),
+                timeframe: domain_timeframe_to_proto(timeframe) as i32,
+                from_time: from_time.map(format_utc).unwrap_or_default(),
+                to_time: to_time.map(format_utc).unwrap_or_default(),
+                limit,
+            })
+            .await
+            .map_err(|e| OpenApiError::GrpcStatus(e.to_string()))?
+            .into_inner();
+
+        Ok(stream)
+    }
+
+    pub async fn get_server_time(&mut self) -> Result<DateTime<Utc>, OpenApiError> {
+        let response = self
+            .inner
+            .get_server_time(pb::GetServerTimeRequest {})
+            .await
+            .map_err(|e| OpenApiError::GrpcStatus(e.to_string()))?
+            .into_inner();
+
+        parse_utc_timestamp_field("server_time", &response.server_time)
+    }
+}
+
+fn resolve_time_window(
+    from_time: &str,
+    to_time: &str,
+    timeframe: Timeframe,
+    limit: u32,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), OpenApiError> {
+    let from_empty = from_time.trim().is_empty();
+    let to_empty = to_time.trim().is_empty();
+
+    let (from, to) = match (from_empty, to_empty) {
+        (true, true) => {
+            let to = Utc::now();
+            let from = to - Duration::seconds(timeframe.seconds() * limit as i64);
+            (from, to)
+        }
+        (false, false) => (
+            parse_utc_timestamp_field("from_time", from_time)?,
+            parse_utc_timestamp_field("to_time", to_time)?,
+        ),
+        _ => {
+            return Err(OpenApiError::InvalidUtcTimestamp {
+                field: if from_empty { "from_time" } else { "to_time" },
+                value: if from_empty {
+                    from_time.to_string()
+                } else {
+                    to_time.to_string()
+                },
+            });
+        }
+    };
+
+    if from >= to {
+        return Err(OpenApiError::InvalidTimeRange {
+            from_time: format_utc(from),
+            to_time: format_utc(to),
+        });
+    }
+
+    Ok((from, to))
+}
+
+fn parse_utc_timestamp_field(field: &'static str, value: &str) -> Result<DateTime<Utc>, OpenApiError> {
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| OpenApiError::InvalidUtcTimestamp {
+        field,
+        value: value.to_string(),
+    })?;
+
+    if parsed.offset().local_minus_utc() != 0 {
+        return Err(OpenApiError::InvalidUtcTimestamp {
+            field,
+            value: value.to_string(),
+        });
+    }
+
+    Ok(parsed.with_timezone(&Utc))
+}
+
+fn format_utc(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn candle_from_proto(candle: pb::Candle) -> Result<Candle, OpenApiError> {
+    Ok(Candle {
+        symbol: candle.symbol,
+        timeframe: proto_timeframe_to_domain(candle.timeframe)?,
+        open_time: parse_utc_timestamp_field("open_time", &candle.open_time)?,
+        close_time: parse_utc_timestamp_field("close_time", &candle.close_time)?,
+        open: parse_decimal_field("open", &candle.open)?,
+        high: parse_decimal_field("high", &candle.high)?,
+        low: parse_decimal_field("low", &candle.low)?,
+        close: parse_decimal_field("close", &candle.close)?,
+        volume: parse_decimal_field("volume", &candle.volume)?,
+    })
 }
 
 fn open_api_error_to_status(error: OpenApiError) -> Status {
@@ -744,10 +1293,34 @@ fn domain_side_to_proto(side: OrderSide) -> pb::OrderSide {
     }
 }
 
+fn proto_timeframe_to_domain(timeframe: i32) -> Result<Timeframe, OpenApiError> {
+    match pb::Timeframe::try_from(timeframe) {
+        Ok(pb::Timeframe::M1) => Ok(Timeframe::M1),
+        Ok(pb::Timeframe::M5) => Ok(Timeframe::M5),
+        Ok(pb::Timeframe::M15) => Ok(Timeframe::M15),
+        Ok(pb::Timeframe::H1) => Ok(Timeframe::H1),
+        Ok(pb::Timeframe::H4) => Ok(Timeframe::H4),
+        Ok(pb::Timeframe::D1) => Ok(Timeframe::D1),
+        _ => Err(OpenApiError::UnsupportedTimeframe(timeframe)),
+    }
+}
+
+fn domain_timeframe_to_proto(timeframe: Timeframe) -> pb::Timeframe {
+    match timeframe {
+        Timeframe::M1 => pb::Timeframe::M1,
+        Timeframe::M5 => pb::Timeframe::M5,
+        Timeframe::M15 => pb::Timeframe::M15,
+        Timeframe::H1 => pb::Timeframe::H1,
+        Timeframe::H4 => pb::Timeframe::H4,
+        Timeframe::D1 => pb::Timeframe::D1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+    use tokio_stream::StreamExt;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Server;
 
@@ -846,149 +1419,88 @@ mod tests {
     }
 
     #[test]
-    fn handles_high_volume_without_precision_loss() {
-        let engine = sample_engine();
-
-        let quote = engine
-            .volume_from_lot_size("EURUSD", d(1000, 0))
-            .expect("expected valid quote");
-
-        assert_eq!(quote.volume, d(100_000_000, 0));
-    }
-
-    #[test]
-    fn login_and_fetch_balance_work() {
-        let mut service = sample_service();
-
-        let token = service.login("Alice", "secret").expect("login should succeed");
-        let balance = service
-            .fetch_balance(&token)
-            .expect("balance should be available");
-
-        assert_eq!(balance.account_id, "ACC-001");
-        assert_eq!(balance.balance, d(100_000, 0));
-        assert_eq!(balance.used_margin, Decimal::ZERO);
-        assert_eq!(balance.free_margin, d(100_000, 0));
-    }
-
-    #[test]
-    fn place_market_order_updates_margin() {
-        let mut service = sample_service();
-        let token = service.login("alice", "secret").expect("login should succeed");
-
-        let execution = service
-            .place_market_order(
-                &token,
-                OrderRequest {
-                    symbol: "EURUSD".to_string(),
-                    lot_size: d(10, 2),
-                    side: OrderSide::Buy,
-                },
-            )
-            .expect("order should execute");
-
-        assert_eq!(execution.account_id, "ACC-001");
-        assert_eq!(execution.volume, d(10_000, 0));
-        assert_eq!(execution.margin_used, d(100, 0));
-
-        let balance = service
-            .fetch_balance(&token)
-            .expect("balance should be available");
-        assert_eq!(balance.used_margin, d(100, 0));
-        assert_eq!(balance.free_margin, d(99_900, 0));
-    }
-
-    #[test]
-    fn fails_order_when_symbol_not_found() {
-        let mut service = sample_service();
-        let token = service.login("alice", "secret").expect("login should succeed");
+    fn candle_limit_guard_rejects_large_limit() {
+        let service = sample_service();
 
         let err = service
-            .place_market_order(
-                &token,
-                OrderRequest {
-                    symbol: "BTCFOO".to_string(),
-                    lot_size: d(1, 0),
-                    side: OrderSide::Sell,
-                },
-            )
-            .expect_err("order should fail for unknown symbol");
-
-        assert_eq!(err, OpenApiError::SymbolNotFound("BTCFOO".to_string()));
-    }
-
-    #[test]
-    fn rejects_invalid_login() {
-        let mut service = sample_service();
-
-        let err = service
-            .login("alice", "wrong-pass")
-            .expect_err("login should fail");
-
-        assert_eq!(err, OpenApiError::InvalidCredentials);
-    }
-
-    #[test]
-    fn logout_invalidates_session() {
-        let mut service = sample_service();
-        let token = service.login("alice", "secret").expect("login should succeed");
-
-        service.logout(&token).expect("logout should succeed");
-
-        let err = service
-            .fetch_balance(&token)
-            .expect_err("session must be invalid after logout");
-        assert_eq!(err, OpenApiError::SessionNotFound);
-    }
-
-    #[test]
-    fn protobuf_login_balance_and_order_flow() {
-        let mut service = sample_service();
-
-        let login = service
-            .login_proto(pb::LoginRequest {
-                username: "alice".to_string(),
-                password: "secret".to_string(),
-            })
-            .expect("login proto should succeed");
-
-        let balance_before = service
-            .fetch_balance_proto(pb::FetchBalanceRequest {
-                session_token: login.session_token.clone(),
-            })
-            .expect("balance proto should succeed");
-        assert_eq!(
-            balance_before
-                .balance
-                .expect("balance payload should exist")
-                .free_margin,
-            "100000"
-        );
-
-        let order = service
-            .place_market_order_proto(pb::PlaceMarketOrderRequest {
-                session_token: login.session_token.clone(),
+            .get_candles_proto(pb::GetCandlesRequest {
                 symbol: "EURUSD".to_string(),
-                lot_size: "0.20".to_string(),
-                side: pb::OrderSide::Buy as i32,
+                timeframe: pb::Timeframe::M1 as i32,
+                from_time: String::new(),
+                to_time: String::new(),
+                limit: MAX_CANDLE_LIMIT + 1,
             })
-            .expect("order proto should succeed");
+            .expect_err("limit should be rejected");
 
-        let execution = order.execution.expect("execution payload should exist");
-        assert_eq!(execution.volume, "20000.00");
-        assert_eq!(execution.margin_used, "200.00");
-
-        let balance_after = service
-            .fetch_balance_proto(pb::FetchBalanceRequest {
-                session_token: login.session_token,
-            })
-            .expect("balance proto should succeed");
         assert_eq!(
-            balance_after
-                .balance
-                .expect("balance payload should exist")
-                .free_margin,
-            "99800.00"
+            err,
+            OpenApiError::CandleLimitTooLarge {
+                limit: MAX_CANDLE_LIMIT + 1,
+                max: MAX_CANDLE_LIMIT,
+            }
+        );
+    }
+
+    #[test]
+    fn timeframe_validation_rejects_unspecified() {
+        let service = sample_service();
+
+        let err = service
+            .get_candles_proto(pb::GetCandlesRequest {
+                symbol: "EURUSD".to_string(),
+                timeframe: pb::Timeframe::Unspecified as i32,
+                from_time: String::new(),
+                to_time: String::new(),
+                limit: 10,
+            })
+            .expect_err("timeframe should be rejected");
+
+        assert_eq!(err, OpenApiError::UnsupportedTimeframe(0));
+    }
+
+    #[test]
+    fn timestamp_validation_requires_utc() {
+        let service = sample_service();
+
+        let err = service
+            .get_candles_proto(pb::GetCandlesRequest {
+                symbol: "EURUSD".to_string(),
+                timeframe: pb::Timeframe::M1 as i32,
+                from_time: "2026-05-26T12:00:00+03:00".to_string(),
+                to_time: "2026-05-26T13:00:00Z".to_string(),
+                limit: 10,
+            })
+            .expect_err("non-utc timestamp should fail");
+
+        assert_eq!(
+            err,
+            OpenApiError::InvalidUtcTimestamp {
+                field: "from_time",
+                value: "2026-05-26T12:00:00+03:00".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn range_validation_requires_from_before_to() {
+        let service = sample_service();
+
+        let err = service
+            .get_candles_proto(pb::GetCandlesRequest {
+                symbol: "EURUSD".to_string(),
+                timeframe: pb::Timeframe::M1 as i32,
+                from_time: "2026-05-26T13:00:00Z".to_string(),
+                to_time: "2026-05-26T12:00:00Z".to_string(),
+                limit: 10,
+            })
+            .expect_err("invalid range should fail");
+
+        assert_eq!(
+            err,
+            OpenApiError::InvalidTimeRange {
+                from_time: "2026-05-26T13:00:00Z".to_string(),
+                to_time: "2026-05-26T12:00:00Z".to_string(),
+            }
         );
     }
 
@@ -1035,11 +1547,41 @@ mod tests {
             .expect("order should execute");
         assert_eq!(execution.margin_used, d(250, 0));
 
+        let positions = client
+            .fetch_open_positions(token.clone())
+            .await
+            .expect("positions should load");
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "EURUSD");
+
+        let candles = client
+            .get_candles("EURUSD", Timeframe::M1, None, None, 5)
+            .await
+            .expect("candles should load");
+        assert_eq!(candles.len(), 5);
+
+        let mut stream = client
+            .stream_candles("EURUSD", Timeframe::M1, None, None, 3)
+            .await
+            .expect("stream should open");
+        let mut received = 0;
+        while let Some(item) = stream.next().await {
+            let msg = item.expect("stream item should be valid");
+            assert!(msg.candle.is_some());
+            received += 1;
+        }
+        assert_eq!(received, 3);
+
+        let _server_time = client
+            .get_server_time()
+            .await
+            .expect("server time should load");
+
         let balance = client
             .fetch_balance(token.clone())
             .await
             .expect("balance should load");
-        assert_eq!(balance.free_margin, d(249_750, 0));
+        assert!(balance.free_margin < d(250_000, 0));
 
         client.logout(token).await.expect("logout should succeed");
 

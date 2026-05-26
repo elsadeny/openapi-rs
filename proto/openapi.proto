@@ -7,14 +7,28 @@ service OpenApiService {
   rpc Login(LoginRequest) returns (LoginResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
   rpc FetchBalance(FetchBalanceRequest) returns (FetchBalanceResponse);
+  rpc FetchOpenPositions(FetchOpenPositionsRequest) returns (FetchOpenPositionsResponse);
   rpc PlaceMarketOrder(PlaceMarketOrderRequest) returns (PlaceMarketOrderResponse);
   rpc QuoteVolume(QuoteVolumeRequest) returns (QuoteVolumeResponse);
+  rpc GetCandles(GetCandlesRequest) returns (GetCandlesResponse);
+  rpc StreamCandles(StreamCandlesRequest) returns (stream StreamCandlesResponse);
+  rpc GetServerTime(GetServerTimeRequest) returns (GetServerTimeResponse);
 }
 
 enum OrderSide {
   ORDER_SIDE_UNSPECIFIED = 0;
   ORDER_SIDE_BUY = 1;
   ORDER_SIDE_SELL = 2;
+}
+
+enum Timeframe {
+  TIMEFRAME_UNSPECIFIED = 0;
+  TIMEFRAME_M1 = 1;
+  TIMEFRAME_M5 = 2;
+  TIMEFRAME_M15 = 3;
+  TIMEFRAME_H1 = 4;
+  TIMEFRAME_H4 = 5;
+  TIMEFRAME_D1 = 6;
 }
 
 message RegisterUserRequest {
@@ -60,6 +74,23 @@ message FetchBalanceResponse {
   AccountBalance balance = 1;
 }
 
+message FetchOpenPositionsRequest {
+  string session_token = 1;
+}
+
+message OpenPosition {
+  uint64 position_id = 1;
+  string account_id = 2;
+  string symbol = 3;
+  string lot_size = 4;
+  string volume = 5;
+  OrderSide side = 6;
+}
+
+message FetchOpenPositionsResponse {
+  repeated OpenPosition positions = 1;
+}
+
 message PlaceMarketOrderRequest {
   string session_token = 1;
   string symbol = 2;
@@ -94,4 +125,46 @@ message VolumeQuote {
 
 message QuoteVolumeResponse {
   VolumeQuote quote = 1;
+}
+
+message Candle {
+  string symbol = 1;
+  Timeframe timeframe = 2;
+  string open_time = 3;
+  string close_time = 4;
+  string open = 5;
+  string high = 6;
+  string low = 7;
+  string close = 8;
+  string volume = 9;
+}
+
+message GetCandlesRequest {
+  string symbol = 1;
+  Timeframe timeframe = 2;
+  string from_time = 3;
+  string to_time = 4;
+  uint32 limit = 5;
+}
+
+message GetCandlesResponse {
+  repeated Candle candles = 1;
+}
+
+message StreamCandlesRequest {
+  string symbol = 1;
+  Timeframe timeframe = 2;
+  string from_time = 3;
+  string to_time = 4;
+  uint32 limit = 5;
+}
+
+message StreamCandlesResponse {
+  Candle candle = 1;
+}
+
+message GetServerTimeRequest {}
+
+message GetServerTimeResponse {
+  string server_time = 1;
 }
